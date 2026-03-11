@@ -1,0 +1,9 @@
+services:
+  gp_message:
+    build: .
+    container_name: gp_message
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
