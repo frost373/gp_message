@@ -1,7 +1,7 @@
 /**
  * 消息转发器入口
  *
- * 功能: 从课程聊天室拉取消息 → 通过QQ机器人单聊转发给你
+ * 功能: 从新版APP群聊WebSocket接收消息 → 通过QQ机器人单聊转发给你
  *
  * 使用方式:
  *   node index.js
@@ -20,7 +20,7 @@ const QQBotGateway = require('./src/qq-gateway');
 const Forwarder = require('./src/forwarder');
 
 async function main() {
-    console.log('🚀 消息转发器 v1.1 (单聊模式)');
+    console.log('🚀 消息转发器 v2.0 (新版APP WebSocket + QQ单聊模式)');
     console.log(`📅 ${new Date().toLocaleString()}\n`);
 
     // 创建课程平台客户端
@@ -54,13 +54,10 @@ async function main() {
         console.error('[Fatal] 未处理的Promise拒绝:', reason);
     });
 
-    // 1. 登录课程平台
-    await platformClient.login();
-
-    // 2. 获取QQ机器人Token
+    // 1. 获取QQ机器人Token
     await qqBot.getAccessToken();
 
-    // 3. 检查是否已配置userOpenId
+    // 2. 检查是否已配置userOpenId
     if (config.qqBot.userOpenId) {
         console.log(`[Main] 已配置 userOpenId: ${config.qqBot.userOpenId}`);
         console.log('[Main] 直接启动转发...\n');
@@ -68,7 +65,7 @@ async function main() {
         return;
     }
 
-    // 4. 没有配置openid，通过WebSocket获取
+    // 3. 没有配置openid，通过QQ开放平台WebSocket获取
     console.log('\n📱 未配置 userOpenId，将通过WebSocket获取...');
     console.log('⏳ 请在QQ上给机器人发送任意消息以绑定...\n');
 

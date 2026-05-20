@@ -1,6 +1,6 @@
 /**
  * 消息转发器核心逻辑
- * 定时轮询课程平台消息 → 转发到QQ
+ * 监听新版APP WebSocket消息 → 转发到QQ
  */
 
 class Forwarder {
@@ -10,13 +10,12 @@ class Forwarder {
         this.config = config;
         // 已转发的消息ID集合
         this.forwardedMessageIds = new Set();
-        // 轮询定时器
-        this.timer = null;
-        // 是否首次拉取（用于控制是否转发已有消息）
-        this.isFirstPoll = true;
+        // 消息队列，避免并发发送导致顺序错乱
+        this.queue = [];
+        this.processingQueue = false;
+        this.messageHandler = null;
         // 统计
         this.stats = {
-            totalPolls: 0,
             totalForwarded: 0,
             totalErrors: 0,
             startTime: null,
@@ -29,8 +28,8 @@ class Forwarder {
     async start() {
         console.log('='.repeat(50));
         console.log('  消息转发器启动');
-        console.log(`  房间ID: ${this.config.platform.roomId}`);
-        console.log(`  轮询间隔: ${this.config.polling.interval}ms`);
+        console.log(`  目标群ID: ${this.config.platform.groupId || this.config.platform.roomId}`);
+        console.log(`  消息来源: 新版APP WebSocket`);
         console.log('='.repeat(50));
 
         // 1. 登录课程平台
@@ -43,12 +42,17 @@ class Forwarder {
             console.warn('[Forwarder] ⚠️ QQ机器人Token获取失败，消息将仅输出到控制台');
         }
 
-        // 3. 首次拉取消息（建立基线）
-        await this.poll();
+        // 3. 订阅平台WebSocket消息
+        if (this.messageHandler) {
+            this.platformClient.off('message', this.messageHandler);
+        }
+        this.messageHandler = (msg) => this.enqueueMessage(msg);
+        this.platformClient.on('message', this.messageHandler);
 
-        // 4. 启动定时轮询
+        // 4. 连接平台WebSocket
+        await this.platformClient.connect();
+
         this.stats.startTime = new Date();
-        this.timer = setInterval(() => this.poll(), this.config.polling.interval);
 
         console.log('[Forwarder] ✅ 转发器已启动，正在监听新消息...');
         console.log('[Forwarder] 按 Ctrl+C 停止');
@@ -58,105 +62,83 @@ class Forwarder {
      * 停止转发器
      */
     stop() {
-        if (this.timer) {
-            clearInterval(this.timer);
-            this.timer = null;
+        if (this.messageHandler) {
+            this.platformClient.off('message', this.messageHandler);
+            this.messageHandler = null;
+        }
+        if (this.platformClient && typeof this.platformClient.disconnect === 'function') {
+            this.platformClient.disconnect();
         }
         console.log('[Forwarder] 转发器已停止');
         this.printStats();
     }
 
     /**
-     * 执行一次轮询
+     * 将收到的WebSocket消息加入队列。
      */
-    async poll() {
-        this.stats.totalPolls++;
-        try {
-            const messages = await this.platformClient.fetchMessages();
-
-            if (!messages || !Array.isArray(messages)) {
-                console.log(`[Forwarder] 返回的消息格式异常:`, typeof messages, messages ? JSON.stringify(messages).substring(0, 200) : 'null');
-                // 如果是对象不是数组，尝试提取有用的字段
-                if (messages && typeof messages === 'object' && !Array.isArray(messages)) {
-                    // 尝试寻找可能的消息数组
-                    const possibleKeys = ['list', 'records', 'rows', 'data', 'messages', 'content'];
-                    for (const key of possibleKeys) {
-                        if (messages[key] && Array.isArray(messages[key])) {
-                            console.log(`[Forwarder] 在字段 '${key}' 中找到消息数组`);
-                            return this.processMessages(messages[key]);
-                        }
-                    }
-                    // 如果有chatMsgList之类的字段
-                    for (const key of Object.keys(messages)) {
-                        if (Array.isArray(messages[key])) {
-                            console.log(`[Forwarder] 在字段 '${key}' 中找到数组 (${messages[key].length} 条)`);
-                            return this.processMessages(messages[key]);
-                        }
-                    }
-                }
-                return;
-            }
-
-            await this.processMessages(messages);
-        } catch (err) {
+    enqueueMessage(message) {
+        this.queue.push(message);
+        this.processQueue().catch((err) => {
             this.stats.totalErrors++;
-            console.error(`[Forwarder] ❌ 轮询失败: ${err.message}`);
+            console.error(`[Forwarder] ❌ 处理消息队列失败: ${err.message}`);
+        });
+    }
+
+    /**
+     * 串行处理消息队列。
+     */
+    async processQueue() {
+        if (this.processingQueue) return;
+        this.processingQueue = true;
+
+        try {
+            while (this.queue.length > 0) {
+                const msg = this.queue.shift();
+                await this.processMessage(msg);
+            }
+        } finally {
+            this.processingQueue = false;
         }
     }
 
     /**
-     * 处理消息列表
+     * 处理单条新版APP消息。
      */
-    async processMessages(messages) {
-        if (this.isFirstPoll) {
-            this.isFirstPoll = false;
-            if (!this.config.polling.forwardExisting) {
-                // 首次运行，记录所有已有消息ID，不转发
-                for (const msg of messages) {
-                    const msgId = this.extractMessageId(msg);
-                    if (msgId) this.forwardedMessageIds.add(msgId);
-                }
-                console.log(`[Forwarder] 📋 已记录 ${this.forwardedMessageIds.size} 条已有消息，后续只转发新消息`);
-                return;
-            }
+    async processMessage(msg) {
+        if (Number(msg.type) === 12) return;
+
+        const msgId = this.extractMessageId(msg);
+        if (msgId && this.forwardedMessageIds.has(msgId)) return;
+        if (msgId) this.forwardedMessageIds.add(msgId);
+
+        const formatted = this.formatMessage(msg);
+        if (!formatted) {
+            await this.markRead(msg);
+            return;
         }
 
-        // 找出新消息
-        const newMessages = [];
-        for (const msg of messages) {
-            const msgId = this.extractMessageId(msg);
-            if (msgId && !this.forwardedMessageIds.has(msgId)) {
-                newMessages.push(msg);
-                this.forwardedMessageIds.add(msgId);
-            }
+        console.log(`[Forwarder] 📬 收到新消息: ${JSON.stringify(formatted).substring(0, 100)}...`);
+
+        try {
+            await this.qqBot.sendMessage(formatted);
+            this.stats.totalForwarded++;
+            console.log(`[Forwarder] ✅ 已转发: ${JSON.stringify(formatted).substring(0, 80)}...`);
+            await this.markRead(msg);
+        } catch (err) {
+            this.stats.totalErrors++;
+            console.error(`[Forwarder] ❌ 转发失败: ${err.message}`);
         }
 
-        if (newMessages.length === 0) return;
+        // 避免消息发送过快
+        await this.sleep(1000);
+    }
 
-        console.log(`[Forwarder] 📬 发现 ${newMessages.length} 条新消息`);
-
-        // API返回的消息数组头部是最新的，反转新消息数组，按时间从小到大（先发送老消息，再发送新消息）顺序转发
-        newMessages.reverse();
-
-        // 逐条转发
-        for (const msg of newMessages) {
-            const formatted = this.formatMessage(msg);
-            if (formatted) {
-                try {
-                    if (typeof formatted === 'object') {
-                        // 支持图文原生推送
-                        await this.qqBot.sendMessage(formatted);
-                    } else {
-                        await this.qqBot.sendMessage(formatted);
-                    }
-                    this.stats.totalForwarded++;
-                    console.log(`[Forwarder] ✅ 已转发: ${JSON.stringify(formatted).substring(0, 80)}...`);
-                } catch (err) {
-                    this.stats.totalErrors++;
-                    console.error(`[Forwarder] ❌ 转发失败: ${err.message}`);
-                }
-                // 避免消息发送过快
-                await this.sleep(1000);
+    async markRead(msg) {
+        if (this.platformClient && typeof this.platformClient.markGroupRead === 'function') {
+            try {
+                await this.platformClient.markGroupRead(msg.groupId);
+            } catch (err) {
+                console.warn(`[Forwarder] 标记已读失败: ${err.message}`);
             }
         }
     }
@@ -166,33 +148,29 @@ class Forwarder {
    */
     extractMessageId(msg) {
         // 真实的API返回字段是 messageId
-        return msg.messageId || msg.id || msg.msgId || msg.chatId || msg.createTime || JSON.stringify(msg);
+        return msg.messageId || msg.id || msg.tmpId || msg.msgId || msg.chatId || msg.createTime || msg.sendTime || JSON.stringify(msg);
     }
 
     /**
      * 格式化消息为发送文本
      */
     formatMessage(msg) {
-        let sender = msg.username || msg.nickName || msg.senderName || msg.sender || msg.fromUser || '未知用户';
-        let content = msg.content || msg.message || msg.text || msg.msg || '';
-        let time = msg.timestamp || msg.createTime || msg.sendTime || msg.time || '';
-
-        // 如果是时间戳，尝试格式化
-        if (time && time.length >= 10 && !isNaN(time)) {
-            try {
-                const date = new Date(time.length === 10 ? parseInt(time) * 1000 : parseInt(time));
-                const zpad = (n) => n.toString().padStart(2, '0');
-                time = `${zpad(date.getHours())}:${zpad(date.getMinutes())}:${zpad(date.getSeconds())}`;
-            } catch (e) {
-                // 忽略解析错误
-            }
+        // 新版APP type=12 是回执/已读状态，不是聊天内容。
+        if (Number(msg.type) === 12) {
+            return null;
         }
+
+        let sender = msg.sendNickName || msg.username || msg.nickName || msg.senderName || msg.sender || msg.fromUser || '未知用户';
+        let content = msg.content || msg.message || msg.text || msg.msg || '';
+        let time = this.formatTime(msg.timestamp || msg.createTime || msg.sendTime || msg.time || '');
 
         if (!content && typeof msg === 'string') {
             content = msg;
         }
 
-        if (!content && !msg.imageUrl && msg.type !== 'image') {
+        const imageUrl = this.extractImageUrl(msg);
+
+        if (!content && !imageUrl && msg.type !== 'image') {
             // 如果无法提取内容，打印原始消息帮助调试
             console.log(`[Forwarder] 🔍 无法提取消息内容:`, JSON.stringify(msg).substring(0, 200));
             return null;
@@ -203,20 +181,72 @@ class Forwarder {
         if (time) {
             formatted += `[${time}] `;
         }
+        if (sender) {
+            formatted += `${sender}: `;
+        }
 
         // 处理图片消息
-        if (msg.type === 'image' || msg.imageUrl) {
+        if (Number(msg.type) === 1 || msg.type === 'image' || imageUrl) {
+            content = this.normalizeImageText(content);
             if (content && content !== '我发图片') {
                 formatted += `${content}\n`;
+            } else {
+                formatted += '[图片]';
             }
             return {
                 content: formatted.trim(),
-                imageUrl: msg.imageUrl
+                imageUrl
             };
         }
 
         formatted += `${content}`;
         return formatted.trim();
+    }
+
+    extractImageUrl(msg) {
+        if (msg.imageUrl) return msg.imageUrl;
+        if (Number(msg.type) !== 1 || !msg.content) return null;
+
+        try {
+            const parsed = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
+            return parsed.originUrl || parsed.thumbUrl || parsed.url || null;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    normalizeImageText(content) {
+        if (!content) return '';
+        if (typeof content !== 'string') return '';
+
+        try {
+            const parsed = JSON.parse(content);
+            if (parsed && typeof parsed === 'object' && (parsed.originUrl || parsed.thumbUrl || parsed.url)) {
+                return '';
+            }
+        } catch (err) {
+            // 普通文本不是JSON时保持原样
+        }
+
+        return content;
+    }
+
+    formatTime(value) {
+        if (!value) return '';
+        const raw = String(value);
+
+        if (/^\d{10,13}$/.test(raw)) {
+            try {
+                const timestamp = raw.length === 10 ? Number(raw) * 1000 : Number(raw);
+                const date = new Date(timestamp);
+                const zpad = (n) => n.toString().padStart(2, '0');
+                return `${zpad(date.getHours())}:${zpad(date.getMinutes())}:${zpad(date.getSeconds())}`;
+            } catch (err) {
+                return raw;
+            }
+        }
+
+        return raw;
     }
 
     /**
@@ -228,7 +258,6 @@ class Forwarder {
             : 0;
         console.log('\n--- 转发器统计 ---');
         console.log(`运行时长: ${runtime}秒`);
-        console.log(`总轮询次数: ${this.stats.totalPolls}`);
         console.log(`总转发消息: ${this.stats.totalForwarded}`);
         console.log(`总错误次数: ${this.stats.totalErrors}`);
         console.log('-'.repeat(20));

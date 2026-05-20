@@ -1,5 +1,5 @@
 /**
- * 测试脚本：拉取最新5条消息并展示格式化后的结果
+ * 测试脚本：连接新版APP WebSocket，打印目标群收到的消息格式。
  */
 const config = require('./config');
 const PlatformClient = require('./src/platform-client');
@@ -7,31 +7,19 @@ const Forwarder = require('./src/forwarder');
 
 async function test() {
     const client = new PlatformClient(config.platform);
-    const forwarder = new Forwarder(client, null, config);
+    const forwarder = new Forwarder(client, { sendMessage: async () => {} }, config);
+
+    client.on('message', (msg) => {
+        console.log('\n[收到目标群消息]');
+        console.log(`ID: ${forwarder.extractMessageId(msg)}`);
+        console.log('原始:', JSON.stringify(msg, null, 2));
+        console.log('格式化:', forwarder.formatMessage(msg));
+    });
 
     await client.login();
-    console.log('\n📬 正在拉取房间消息...\n');
+    await client.connect();
 
-    const messages = await client.fetchMessages();
-
-    if (!messages || messages.length === 0) {
-        console.log('❌ 未获取到任何消息');
-        return;
-    }
-
-    console.log(`✅ 成功拉取到 ${messages.length} 条历史消息`);
-
-    // 接口返回的数组头部是最新的，我们需要取前5条，然后反转（按时间从老到新发送）
-    const latest = messages.slice(0, 5).reverse();
-
-    console.log(`\n--- 最新 ${latest.length} 条消息将如此发送 ---\n`);
-
-    latest.forEach((msg, i) => {
-        console.log(`[消息 ${i + 1}] (ID: ${forwarder.extractMessageId(msg)})`);
-        const formatted = forwarder.formatMessage(msg);
-        console.log(formatted);
-        console.log('\n' + '-'.repeat(40) + '\n');
-    });
+    console.log(`正在监听 groupId=${config.platform.groupId || config.platform.roomId} 的新版APP消息，按 Ctrl+C 退出...`);
 }
 
 test().catch(console.error);
