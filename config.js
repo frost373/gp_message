@@ -19,6 +19,11 @@ module.exports = {
     roomId: parseInt(process.env.PLATFORM_GROUP_ID || process.env.PLATFORM_ROOM_ID) || 9,
     heartbeatIntervalMs: parseInt(process.env.PLATFORM_HEARTBEAT_INTERVAL_MS) || 21000,
     reconnectDelayMs: parseInt(process.env.PLATFORM_RECONNECT_DELAY_MS) || 5000,
+    statusLogIntervalMs: parseInt(process.env.PLATFORM_STATUS_LOG_INTERVAL_MS) || 60000,
+    logConnectionStatus: process.env.PLATFORM_LOG_CONNECTION_STATUS !== 'false',
+    logHeartbeatEvents: process.env.PLATFORM_LOG_HEARTBEAT_EVENTS !== 'false',
+    logIncomingMessages: process.env.PLATFORM_LOG_INCOMING_MESSAGES !== 'false',
+    logIgnoredMessages: process.env.PLATFORM_LOG_IGNORED_MESSAGES === 'true',
   },
 
   // QQ机器人配置

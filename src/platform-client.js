@@ -22,9 +22,15 @@ class PlatformClient extends EventEmitter {
         this.connectReject = null;
         this.connectTimeout = null;
         this.heartbeatTimer = null;
+        this.statusTimer = null;
         this.reconnectTimer = null;
         this.manuallyClosed = false;
         this.authenticated = false;
+        this.lastHeartbeatSentAt = 0;
+        this.lastHeartbeatAckAt = 0;
+        this.lastMessageAt = 0;
+        this.lastAuthAt = 0;
+        this.connectStartedAt = 0;
 
         this.client = axios.create({
             baseURL: config.baseUrl,
@@ -158,6 +164,8 @@ class PlatformClient extends EventEmitter {
         }
 
         this.manuallyClosed = false;
+        this.connectStartedAt = Date.now();
+        this.startStatusLogger();
         await this.ensureAccessToken();
 
         const wsUrl = this.getWebSocketUrl();
@@ -232,6 +240,8 @@ class PlatformClient extends EventEmitter {
                 this.handleAuthAck(payload);
                 break;
             case 1:
+                this.lastHeartbeatAckAt = Date.now();
+                this.logHeartbeatAck();
                 break;
             case 4:
                 this.handleIncomingMessage(payload.data);
@@ -247,8 +257,10 @@ class PlatformClient extends EventEmitter {
     handleAuthAck(payload) {
         if (payload.data === null || payload.data === undefined) {
             this.authenticated = true;
+            this.lastAuthAt = Date.now();
             console.log('[Platform] WebSocket鉴权成功');
             this.startHeartbeat();
+            this.printConnectionStatus('auth-ok');
             this.resolveConnect();
             this.emit('ready');
             return;
@@ -276,6 +288,8 @@ class PlatformClient extends EventEmitter {
             return;
         }
 
+        this.lastMessageAt = Date.now();
+        this.logIncomingMessage(message);
         this.emit('message', message);
     }
 
@@ -291,12 +305,23 @@ class PlatformClient extends EventEmitter {
         const interval = Number(this.config.heartbeatIntervalMs || 21000);
         const sendHeartbeat = () => {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.lastHeartbeatSentAt = Date.now();
+                this.logHeartbeatSend();
                 this.sendWs({ cmd: 1, data: {} });
             }
         };
 
         sendHeartbeat();
         this.heartbeatTimer = setInterval(sendHeartbeat, interval);
+    }
+
+    startStatusLogger() {
+        if (this.statusTimer) return;
+
+        const interval = Number(this.config.statusLogIntervalMs || 60000);
+        this.statusTimer = setInterval(() => {
+            this.printConnectionStatus('tick');
+        }, interval);
     }
 
     sendWs(payload) {
@@ -364,6 +389,10 @@ class PlatformClient extends EventEmitter {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        if (this.statusTimer) {
+            clearInterval(this.statusTimer);
+            this.statusTimer = null;
+        }
         this.cleanupConnection();
         this.closeSocket();
     }
@@ -407,6 +436,80 @@ class PlatformClient extends EventEmitter {
 
     async fetchMessageCount() {
         return 0;
+    }
+
+    logHeartbeatSend() {
+        if (this.config.logHeartbeatEvents === false) return;
+        console.log(`[Platform] 心跳发送 -> cmd=1 (${this.describeAge(this.lastHeartbeatSentAt)})`);
+    }
+
+    logHeartbeatAck() {
+        if (this.config.logHeartbeatEvents === false) return;
+        console.log(`[Platform] 心跳确认 <- cmd=1 (${this.describeAge(this.lastHeartbeatAckAt)})`);
+    }
+
+    logIncomingMessage(message) {
+        if (this.config.logIncomingMessages === false) return;
+
+        const sender = message.sendNickName || message.nickName || message.username || '未知用户';
+        const type = message.type;
+        const msgId = message.id || message.messageId || message.tmpId || '-';
+        const preview = this.previewMessage(message);
+        console.log(`[Platform] 收到群消息 group=${message.groupId} type=${type} id=${msgId} sender=${sender} content=${preview}`);
+    }
+
+    previewMessage(message) {
+        if (Number(message.type) === 1) return '[图片]';
+        const content = message.content;
+        if (!content) return '(空)';
+        if (typeof content === 'string') {
+            return content.replace(/\s+/g, ' ').slice(0, 120);
+        }
+        try {
+            return JSON.stringify(content).slice(0, 120);
+        } catch (err) {
+            return '(不可序列化)';
+        }
+    }
+
+    printConnectionStatus(trigger = 'status') {
+        if (this.config.logConnectionStatus === false) return;
+
+        const wsState = this.ws ? this.ws.readyState : WebSocket.CLOSED;
+        const wsStateText = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][wsState] || String(wsState);
+        const parts = [
+            `ws=${wsStateText}`,
+            `auth=${this.authenticated ? 'yes' : 'no'}`,
+            `devId=${this.devId}`,
+            `group=${this.config.groupId || this.config.roomId || '-'}`,
+            `up=${this.describeAge(this.lastHeartbeatSentAt)}`,
+            `ack=${this.describeAge(this.lastHeartbeatAckAt)}`,
+            `msg=${this.describeAge(this.lastMessageAt)}`,
+            `token=${this.describeTokenExpiry(this.accessTokenExpiresAt)}`,
+            `refresh=${this.describeTokenExpiry(this.refreshTokenExpiresAt)}`,
+            `sinceConnect=${this.describeAge(this.connectStartedAt)}`,
+        ];
+
+        console.log(`[Platform] 状态(${trigger}) ${parts.join(' ')}`);
+    }
+
+    describeAge(timestamp) {
+        if (!timestamp) return 'never';
+        const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        const remain = seconds % 60;
+        return `${minutes}m${remain.toString().padStart(2, '0')}s`;
+    }
+
+    describeTokenExpiry(expiresAt) {
+        if (!expiresAt) return 'unknown';
+        const seconds = Math.floor((expiresAt - Date.now()) / 1000);
+        if (seconds <= 0) return 'expired';
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        const remain = seconds % 60;
+        return `${minutes}m${remain.toString().padStart(2, '0')}s`;
     }
 }
 
